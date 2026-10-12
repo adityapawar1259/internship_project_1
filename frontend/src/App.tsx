@@ -233,7 +233,7 @@ export default function App() {
           <input value={tenant} onChange={(e) => setTenant(e.target.value)} />
         </label>
         <label>
-          API key (only if enabled)
+          API key (only if enabled) 
           <input
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
