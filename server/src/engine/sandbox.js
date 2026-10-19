@@ -1,4 +1,4 @@
-import { Worker } from 'node:worker_threads';
+import { Worker } from "node:worker_threads";
 
 // User-defined scripts run in a separate Worker Thread with a hard memory cap and timeout,
 // inside a fresh vm context that has no require/process/fetch.
@@ -12,11 +12,29 @@ try {
 } catch (e) { parentPort.postMessage({ ok: false, error: String(e && e.message || e) }); }
 `;
 
-export function runInSandbox(code, input = {}, { timeout = 1000, memoryMb = 64 } = {}) {
+export function runInSandbox(
+  code,
+  input = {},
+  { timeout = 1000, memoryMb = 64 } = {},
+) {
   return new Promise((resolve, reject) => {
-    const w = new Worker(SRC, { eval: true, workerData: { code, input, timeout }, resourceLimits: { maxOldGenerationSizeMb: memoryMb } });
-    const killer = setTimeout(() => { w.terminate(); reject(new Error('Script timed out')); }, timeout + 300);
-    w.once('message', (m) => { clearTimeout(killer); w.terminate(); m.ok ? resolve(m.result) : reject(new Error(m.error)); });
-    w.once('error', (e) => { clearTimeout(killer); reject(e); });
+    const w = new Worker(SRC, {
+      eval: true,
+      workerData: { code, input, timeout },
+      resourceLimits: { maxOldGenerationSizeMb: memoryMb },
+    });
+    const killer = setTimeout(() => {
+      w.terminate();
+      reject(new Error("Script timed out"));
+    }, timeout + 300);
+    w.once("message", (m) => {
+      clearTimeout(killer);
+      w.terminate();
+      m.ok ? resolve(m.result) : reject(new Error(m.error));
+    });
+    w.once("error", (e) => {
+      clearTimeout(killer);
+      reject(e);
+    });
   });
 }

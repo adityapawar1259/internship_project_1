@@ -17,7 +17,7 @@ export function attachSockets(httpServer) {
   });
   io.on("connection", (socket) => {
     socket.join(`tenant:${socket.data.tenantId}`);
-    socket.on("watch", (executionId) => socket.join(`exec:${executionId}`)); 
+    socket.on("watch", (executionId) => socket.join(`exec:${executionId}`));
   });
   const sub = makeRedis();
   sub.subscribe("exec-events");
