@@ -1,0 +1,37 @@
+services:
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"] # replica set is required for Change Streams
+    ports: ["27017:27017"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'mongosh --quiet --eval "try{rs.status().ok}catch(e){rs.initiate({_id:''rs0'',members:[{_id:0,host:''mongo:27017''}]}).ok}"',
+        ]
+      interval: 5s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  api:
+    build: ./server
+    environment: &env
+      MONGO_URI: mongodb://mongo:27017/workflow?replicaSet=rs0
+      REDIS_URL: redis://redis:6379 
+      ADMIN_SECRET: ${ADMIN_SECRET:-change-me}
+    ports: ["4000:4000"]
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_started }
+  worker:
+    build: ./server
+    command: ["node", "src/worker.js"]
+    environment: *env
+    deploy: { replicas: 2 }
+    depends_on:
+      mongo: { condition: service_healthy }
+      redis: { condition: service_started }
+  client:
+    build: ./client 
+    ports: ["8080:80"]
