@@ -1,214 +1,93 @@
-import React, { useCallback, useEffect, useState } from "react";
-import ReactFlow, {
-  addEdge,
-  applyNodeChanges,
-  applyEdgeChanges,
-  Background,
-  Controls,
-} from "reactflow";
-import "reactflow/dist/style.css";
-import { io } from "socket.io-client";
-import { nodeTypes } from "./nodes.jsx";
-import { validate } from "./validate.js";
-import Dashboard from "./Dashboard.jsx";
+import React, { useCallback, useEffect, useState } from 'react';
+import { AppCtx } from './ctx.js';
+import { api, connectSocket, getKey, setKey, API } from './api.js';
+import Login from './pages/Login.jsx';
+import Builder from './pages/Builder.jsx';
+import Workflows from './pages/Workflows.jsx';
+import Executions from './pages/Executions.jsx';
+import Dlq from './pages/Dlq.jsx';
+import Dashboard from './pages/Dashboard.jsx';
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
-const DEFAULTS = {
-  http: {
-    label: "HTTP call",
-    url: "https://httpbin.org/post",
-    method: "POST",
-    compensation: { type: "http", url: "https://httpbin.org/post" },
-  },
-  delay: { label: "Delay", ms: 500 },
-  script: { label: "Transform", code: "({ doubled: (input.n || 1) * 2 })" },
-  condition: { label: "Condition", expression: "(input.n || 0) > 5" },
-};
+const NAV = [
+  ['builder', '🧩', 'Builder'], ['workflows', '📚', 'Workflows'], ['executions', '⚡', 'Executions'],
+  ['dlq', '📮', 'Dead letters'], ['dashboard', '📊', 'Dashboard'],
+];
+const TITLES = { builder: 'Workflow builder', workflows: 'My workflows', executions: 'Executions', dlq: 'Dead-letter queue', dashboard: 'Admin dashboard' };
 
 export default function App() {
-  const [apiKey, setApiKey] = useState(localStorage.getItem("apiKey") || "");
-  const [tab, setTab] = useState("builder");
-  const [nodes, setNodes] = useState([
-    {
-      id: "start",
-      type: "start",
-      position: { x: 250, y: 20 },
-      data: { label: "Start" },
-    },
-  ]);
-  const [edges, setEdges] = useState([]);
-  const [name, setName] = useState("My workflow");
-  const [msgs, setMsgs] = useState([]);
-  const [wfId, setWfId] = useState(null);
-  const headers = { "content-type": "application/json", "x-api-key": apiKey };
+  const [me, setMe] = useState(null);
+  const [checking, setChecking] = useState(!!getKey());
+  const [socket, setSocket] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const [page, setPage] = useState('builder');
+  const [editId, setEditId] = useState(null);
+  const [toasts, setToasts] = useState([]);
 
-  useEffect(() => {
-    if (!apiKey) return;
-    localStorage.setItem("apiKey", apiKey);
-    const socket = io(API, { auth: { apiKey } });
-    socket.on("trace", (ev) => {
-      // live node tracing
-      if (ev.type === "node")
-        setNodes((ns) =>
-          ns.map((n) =>
-            n.id === ev.nodeId
-              ? {
-                  ...n,
-                  data: { ...n.data, state: ev.state, attempts: ev.attempts },
-                }
-              : n,
-          ),
-        );
-      setMsgs((m) => [
-        ...m.slice(-50),
-        `${ev.type} ${ev.nodeId || ""} ${ev.state}${ev.error ? " - " + ev.error : ""}`,
-      ]);
-    });
-    return () => socket.close();
-  }, [apiKey]);
+  const toast = useCallback((text, kind = 'info') => {
+    const id = Math.random();
+    setToasts((t) => [...t, { id, text, kind }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4200);
+  }, []);
 
-  const onNodesChange = useCallback(
-    (c) => setNodes((n) => applyNodeChanges(c, n)),
-    [],
-  );
-  const onEdgesChange = useCallback(
-    (c) => setEdges((e) => applyEdgeChanges(c, e)),
-    [],
-  );
-  const onConnect = useCallback((c) => setEdges((e) => addEdge(c, e)), []);
-  const addNode = (type) =>
-    setNodes((n) => [
-      ...n,
-      {
-        id: `${type}-${Date.now() % 100000}`,
-        type,
-        position: { x: 150 + Math.random() * 200, y: 120 + n.length * 70 },
-        data: { ...DEFAULTS[type] },
-      },
-    ]);
-  const errors = validate(nodes, edges);
-  const graph = () => ({
-    nodes: nodes.map(({ id, type, data }) => ({
-      id,
-      type,
-      data: { ...data, state: undefined },
-    })),
-    edges: edges.map(({ id, source, target, sourceHandle }) => ({
-      id,
-      source,
-      target,
-      sourceHandle,
-    })),
-  });
+  const login = useCallback(async (key) => {
+    const info = await api('/api/me', { key });   // throws if the key is wrong
+    setKey(key); setMe(info); return info;
+  }, []);
+  const logout = () => { setKey(''); setMe(null); socket?.close(); setSocket(null); };
 
-  const save = async () => {
-    const r = await fetch(`${API}/api/workflows`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ name, graph: graph() }),
-    });
-    const j = await r.json();
-    if (r.ok) {
-      setWfId(j._id);
-      setMsgs((m) => [...m, "Saved ✔"]);
-    } else setMsgs((m) => [...m, "Rejected: " + (j.errors || []).join("; ")]);
-  };
-  const run = async () => {
-    setNodes((ns) =>
-      ns.map((n) => ({ ...n, data: { ...n.data, state: undefined } })),
-    );
-    await fetch(`${API}/api/workflows/${wfId}/run`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ input: { n: 7 } }),
-    });
-  };
+  useEffect(() => { // auto-login with the saved key
+    if (!getKey()) return;
+    login(getKey()).catch(() => setKey('')).finally(() => setChecking(false));
+  }, [login]);
 
+  useEffect(() => { // one live WebSocket connection for the whole app
+    if (!me) return;
+    const s = connectSocket(getKey());
+    s.on('connect', () => setConnected(true)); s.on('disconnect', () => setConnected(false));
+    setSocket(s);
+    return () => s.close();
+  }, [me?.id]);
+
+  const refreshMe = () => api('/api/me').then(setMe).catch(() => {});
+  const openBuilder = (id = null) => { setEditId(id); setPage('builder'); };
+
+  if (checking) return <div className="login"><div className="muted">Loading…</div></div>;
+  if (!me) return <><Login onLogin={login} toast={toast} /><Toasts items={toasts} /></>;
+
+  const ctx = { me, socket, toast, refreshMe, openBuilder, setPage };
   return (
-    <div
-      style={{
-        fontFamily: "sans-serif",
-        height: "100vh",
-        display: "flex",
-        flexDirection: "column",
-      }}
-    >
-      <header
-        style={{
-          padding: 8,
-          display: "flex",
-          gap: 8,
-          borderBottom: "1px solid #ccc",
-          alignItems: "center",
-        }}
-      >
-        <input
-          placeholder="API key"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
-          style={{ width: 260 }}
-        />
-        <button onClick={() => setTab("builder")}>Builder</button>
-        <button onClick={() => setTab("dashboard")}>Dashboard</button>
-      </header>
-      {tab === "dashboard" ? (
-        <Dashboard api={API} headers={headers} />
-      ) : (
-        <div style={{ flex: 1, display: "flex" }}>
-          <div style={{ flex: 1 }}>
-            <div
-              style={{ padding: 8, display: "flex", gap: 6, flexWrap: "wrap" }}
-            >
-              <input value={name} onChange={(e) => setName(e.target.value)} />
-              {Object.keys(DEFAULTS).map((t) => (
-                <button key={t} onClick={() => addNode(t)}>
-                  + {t}
-                </button>
-              ))}
-              <button disabled={errors.length > 0} onClick={save}>
-                Save
-              </button>
-              <button disabled={!wfId} onClick={run}>
-                Run
-              </button>
-            </div>
-            {errors.length > 0 && (
-              <div style={{ color: "#b91c1c", padding: "0 8px", fontSize: 12 }}>
-                {errors.join(" • ")}
-              </div>
-            )}
-            <div style={{ height: "calc(100% - 70px)" }}>
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                nodeTypes={nodeTypes}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                onConnect={onConnect}
-                fitView
-              >
-                <Background />
-                <Controls />
-              </ReactFlow>
-            </div>
+    <AppCtx.Provider value={ctx}>
+      <div className="app">
+        <aside className="sidebar">
+          <div className="brand"><div className="logo">⚙</div><span>FlowForge</span></div>
+          <nav className="nav">
+            {NAV.map(([id, icon, label]) => (
+              <button key={id} className={page === id ? 'active' : ''} onClick={() => (id === 'builder' ? openBuilder(null) : setPage(id))}>
+                <span>{icon}</span><span className="lbl">{label}</span>
+              </button>))}
+          </nav>
+          <div className="side-foot">
+            <b>{me.name}</b>
+            <div>{me.usedThisMonth}/{me.monthlyQuota} runs this month</div>
+            <button className="btn sm" style={{ marginTop: 8 }} onClick={logout}>Sign out</button>
           </div>
-          <aside
-            style={{
-              width: 280,
-              borderLeft: "1px solid #ccc",
-              padding: 8,
-              overflow: "auto",
-              fontFamily: "monospace",
-              fontSize: 11,
-            }}
-          >
-            <b>Live trace</b>
-            {msgs.map((m, i) => (
-              <div key={i}>{m}</div>
-            ))}
-          </aside>
+        </aside>
+        <div className="main">
+          <div className="topbar">
+            <h2>{TITLES[page]}</h2>
+            <span className="muted small"><span className={`dot ${connected ? 'on' : ''}`} />{connected ? 'Live connection' : 'Connecting…'} · {API}</span>
+          </div>
+          <div className={`content ${page === 'builder' ? 'fill' : ''}`}>
+            {page === 'builder' && <Builder key={editId || 'new'} workflowId={editId} />}
+            {page === 'workflows' && <Workflows />}
+            {page === 'executions' && <Executions />}
+            {page === 'dlq' && <Dlq />}
+            {page === 'dashboard' && <Dashboard />}
+          </div>
         </div>
-      )}
-    </div>
+      </div>
+      <Toasts items={toasts} />
+    </AppCtx.Provider>
   );
 }
+const Toasts = ({ items }) => <div className="toasts">{items.map((t) => <div key={t.id} className={`toast ${t.kind}`}>{t.text}</div>)}</div>;
