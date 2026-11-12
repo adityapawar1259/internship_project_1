@@ -48,7 +48,7 @@ export default function Login({ onLogin, toast }) {
     <div className="login">
       <div className="login-box">
         <div className="title">
-          <h1>⚙ FlowForge</h1>
+          <h1>⚙ Workflow Engine</h1>
           <div className="muted">Distributed workflow automation engine</div>
         </div>
         <div className="grid g2">
