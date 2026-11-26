@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { User, Tenant } from "./models.js";
-import { redis } from "./redis.js";
+import { RevokedToken } from "./models.js";
 import { config } from "./config.js";
 import {
   hashPassword,
@@ -17,12 +17,19 @@ const wrap = (fn) => (req, res, next) => fn(req, res).catch(next);
 const fail = (res, status, error, errors) =>
   res.status(status).json({ error, ...(errors ? { errors } : {}) });
 
-// Max `max` hits per `windowSec` for a key (Redis-backed, works across API instances).
+// Per-process login and registration throttling for local development.
+const attempts = new Map();
 async function allow(key, max, windowSec) {
-  const n = await redis.incr(key);
-  if (n === 1) await redis.expire(key, windowSec);
-  return n <= max;
+  const now = Date.now();
+  const old = attempts.get(key);
+  if (!old || now - old.start > windowSec * 1000) {
+    attempts.set(key, { start: now, count: 1 });
+    return true;
+  }
+  old.count++;
+  return old.count <= max;
 }
+
 const publicUser = (u) => ({
   id: u._id,
   name: u.name,
@@ -94,7 +101,6 @@ authRouter.post(
       user ? user.passwordHash : DUMMY_HASH,
     ); // same work either way
     if (!user || !ok) return fail(res, 401, "Invalid email or password");
-    await redis.del(`login:${req.ip}:${email}`);
     const tenant = await Tenant.findById(user.tenantId);
     res.json({
       token: signToken({ sub: String(user._id), tid: String(user.tenantId) }),
@@ -104,18 +110,17 @@ authRouter.post(
   }),
 );
 
-// Real logout: the token's id goes on a Redis deny-list until it would have expired anyway.
+// Persist the token id in MongoDB until its natural expiry (real logout).
 authRouter.post(
   "/logout",
   wrap(async (req, res) => {
     const h = req.header("authorization") || "";
     const p = h.startsWith("Bearer ") ? verifyToken(h.slice(7)) : null;
     if (p)
-      await redis.set(
-        `revoked:${p.jti}`,
-        "1",
-        "EX",
-        Math.max(1, p.exp - Math.floor(Date.now() / 1000)),
+      await RevokedToken.updateOne(
+        { jti: p.jti },
+        { $set: { jti: p.jti, expiresAt: new Date(p.exp * 1000) } },
+        { upsert: true },
       );
     res.json({ ok: true });
   }),

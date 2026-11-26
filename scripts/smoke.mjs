@@ -51,6 +51,69 @@ const check = (ok, msg) => {
   if (!ok) failed = true;
 };
 
+// 0) accounts: sign-up validation, login, wrong password, logout really invalidates the token
+const post = async (path, body, token) => {
+  const r = await fetch(API + path, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  return { status: r.status, body: await r.json().catch(() => ({})) };
+};
+const email = `smoke${Date.now()}@example.com`;
+const pw = "Smoke1234";
+check(
+  (await post("/api/auth/register", { name: "S", email: "bad", password: "x" }))
+    .status === 400,
+  "sign-up rejects invalid input (400)",
+);
+const reg = await post("/api/auth/register", {
+  name: "Smoke Tester",
+  email,
+  password: pw,
+});
+check(
+  reg.status === 201 && !!reg.body.token,
+  "sign-up creates an account and returns a token",
+);
+check(
+  (
+    await post("/api/auth/register", {
+      name: "Smoke Tester",
+      email,
+      password: pw,
+    })
+  ).status === 409,
+  "duplicate email rejected (409)",
+);
+check(
+  (await post("/api/auth/login", { email, password: "Wrong1234" })).status ===
+    401,
+  "wrong password rejected (401)",
+);
+const lg = await post("/api/auth/login", { email, password: pw });
+check(lg.status === 200 && !!lg.body.token, "login returns a token");
+const meRes = await fetch(API + "/api/me", {
+  headers: { authorization: `Bearer ${lg.body.token}` },
+});
+check(
+  meRes.status === 200 && (await meRes.json()).user?.email === email,
+  "/api/me works with the token",
+);
+check((await fetch(API + "/api/me")).status === 401, "no token -> 401");
+await post("/api/auth/logout", {}, lg.body.token);
+check(
+  (
+    await fetch(API + "/api/me", {
+      headers: { authorization: `Bearer ${lg.body.token}` },
+    })
+  ).status === 401,
+  "token is rejected after logout",
+);
+
 const t = await call(
   "/api/tenants",
   "POST",

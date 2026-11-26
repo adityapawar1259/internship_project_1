@@ -1,5 +1,3 @@
-
-
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import ReactFlow, {
   addEdge,
@@ -155,11 +153,7 @@ export default function Builder({ workflowId }) {
     })),
   });
   const save = async () => {
-    const body = {
-      name,
-      graph: graph(),
-      trigger: trigger ? { event: trigger } : undefined,
-    };
+    const body = { name, graph: graph(), trigger: { event: trigger.trim() } };
     const wf = id
       ? await api(`/api/workflows/${id}`, { method: "PUT", body })
       : await api("/api/workflows", { method: "POST", body });

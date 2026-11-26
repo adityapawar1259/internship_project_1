@@ -16,6 +16,30 @@ export const Tenant = mongoose.model(
       name: { type: String, required: true },
       monthlyQuota: { type: Number, default: 10000 },
       usedThisMonth: { type: Number, default: 0 },
+      quotaMonth: {
+        type: String,
+        default: () => new Date().toISOString().slice(0, 7),
+      },
+    },
+    { timestamps: true },
+  ),
+);
+
+export const User = mongoose.model(
+  "User",
+  new Schema(
+    {
+      tenantId: tenantField,
+      name: { type: String, required: true, trim: true },
+      email: {
+        type: String,
+        required: true,
+        unique: true,
+        lowercase: true,
+        trim: true,
+      },
+      passwordHash: { type: String, required: true }, // scrypt salt:hash, never the password
+      role: { type: String, default: "owner" },
     },
     { timestamps: true },
   ),
@@ -92,6 +116,17 @@ export const DeadLetter = mongoose.model(
       tenantId: tenantField,
       executionId: Schema.Types.ObjectId,
       reason: String,
+    },
+    { timestamps: true },
+  ),
+);
+
+export const RevokedToken = mongoose.model(
+  "RevokedToken",
+  new Schema(
+    {
+      jti: { type: String, unique: true, required: true },
+      expiresAt: { type: Date, required: true, index: { expires: 0 } },
     },
     { timestamps: true },
   ),

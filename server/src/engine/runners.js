@@ -1,12 +1,23 @@
 import { runInSandbox } from "./sandbox.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Scripts see the workflow input as `input` (e.g. input.n) and earlier step results as input.outputs.<nodeId>
+const vars = (ctx) => ({ ...(ctx.input || {}), outputs: ctx.outputs || {} });
 
-async function http(cfg) {
+async function http(cfg, idemKey) {
   const res = await fetch(cfg.url, {
     method: cfg.method || "POST",
-    headers: { "content-type": "application/json", ...(cfg.headers || {}) },
-    body: cfg.method === "GET" ? undefined : JSON.stringify(cfg.body ?? {}),
+    headers: {
+      "content-type": "application/json",
+      ...(idemKey ? { "idempotency-key": idemKey } : {}),
+      ...(cfg.headers || {}),
+    },
+    body:
+      cfg.method === "GET"
+        ? undefined
+        : JSON.stringify(
+            cfg.bodyText ? JSON.parse(cfg.bodyText) : (cfg.body ?? {}),
+          ),
     signal: AbortSignal.timeout(cfg.timeoutMs || 10000),
   });
   if (!res.ok) {
@@ -29,12 +40,15 @@ export const runners = {
     await sleep(d.ms || 0);
     return {};
   },
-  http: async (d) => http(d),
+  http: async (d, ctx) =>
+    http(d, ctx.executionId ? `${ctx.executionId}:${ctx.nodeId}` : undefined),
   script: async (d, ctx) => ({
-    result: await runInSandbox(d.code, ctx, { timeout: d.timeoutMs || 1000 }),
+    result: await runInSandbox(d.code, vars(ctx), {
+      timeout: d.timeoutMs || 1000,
+    }),
   }),
   condition: async (d, ctx) => ({
-    branch: (await runInSandbox(d.expression, ctx)) ? "true" : "false",
+    branch: (await runInSandbox(d.expression, vars(ctx))) ? "true" : "false",
   }),
 };
 
@@ -42,6 +56,10 @@ export const runners = {
 export async function compensate(node, ctx) {
   const c = node.data?.compensation;
   if (!c) return;
-  if (c.type === "http") await http(c);
-  else if (c.type === "script") await runInSandbox(c.code, ctx);
+  if (c.type === "http")
+    await http(
+      c,
+      ctx.executionId ? `${ctx.executionId}:${node.id}:undo` : undefined,
+    );
+  else if (c.type === "script") await runInSandbox(c.code, vars(ctx));
 }

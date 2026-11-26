@@ -1,87 +1,103 @@
-import { Worker } from "bullmq";
-import { connectDb } from "./db.js";
 import { Execution, Workflow, DeadLetter } from "./models.js";
-import { redis, makeRedis } from "./redis.js";
-import { dlq } from "./queue.js";
 import { runSaga } from "./engine/saga.js";
 import { runners, compensate } from "./engine/runners.js";
-import { config } from "./config.js";
-
-await connectDb();
-const pub = makeRedis();
-
-async function handleJob(job) {
-  const exec = await Execution.findById(job.data.executionId);
-  const wf = await Workflow.findOne({
-    _id: exec.workflowId,
-    tenantId: exec.tenantId,
-  });
-  const room = `tenant:${exec.tenantId}`;
-  const emit = (ev) =>
-    pub.publish(
-      "exec-events",
-      JSON.stringify({ room, executionId: String(exec._id), ...ev }),
+import { emitTenant } from "./sockets.js";
+let busy = false;
+async function processOne() {
+  if (busy) return;
+  busy = true;
+  let claimed = null;
+  try {
+    const exec = await Execution.findOneAndUpdate(
+      { status: "PENDING" },
+      { $set: { status: "RUNNING", startedAt: new Date(), steps: [] } },
+      { new: true, sort: { createdAt: 1 } },
     );
-
-  exec.status = "RUNNING";
-  exec.startedAt = new Date();
-  await exec.save();
-  const result = await runSaga({
-    graph: wf.graph,
-    input: exec.input || {},
-    runners,
-    compensate,
-    onEvent: (ev) => {
-      emit(ev);
-      if (
-        ev.type === "node" &&
-        ["COMPLETED", "FAILED", "SKIPPED", "COMPENSATED"].includes(ev.state)
-      ) {
-        const { nodeId, state, attempts, durationMs, error, output } = ev;
-        exec.steps.push({ nodeId, state, attempts, durationMs, error, output });
-      }
-    },
-  });
-  exec.status = result.status;
-  exec.error = result.error;
-  exec.finishedAt = new Date();
-  await exec.save();
-  if (result.status === "ROLLED_BACK") {
-    // Permanently failed workflow -> dead-letter queue so an operator can inspect/replay it.
-    await DeadLetter.create({
+    if (!exec) return;
+    claimed = exec;
+    const wf = await Workflow.findOne({
+      _id: exec.workflowId,
       tenantId: exec.tenantId,
-      executionId: exec._id,
-      reason: result.error,
     });
-    await dlq.add("failed-execution", {
+    if (!wf) throw new Error("Workflow no longer exists");
+    const result = await runSaga({
+      graph: wf.graph,
+      input: exec.input || {},
+      runners,
+      compensate,
       executionId: String(exec._id),
-      reason: result.error,
+      onEvent: (ev) => {
+        emitTenant(exec.tenantId, { executionId: String(exec._id), ...ev });
+        if (
+          ev.type === "node" &&
+          [
+            "COMPLETED",
+            "FAILED",
+            "SKIPPED",
+            "COMPENSATED",
+            "COMPENSATION_FAILED",
+          ].includes(ev.state)
+        ) {
+          const { nodeId, state, attempts, durationMs, error, output } = ev;
+          exec.steps.push({
+            nodeId,
+            state,
+            attempts,
+            durationMs,
+            error,
+            output,
+          });
+        }
+      },
     });
-  }
-}
-
-const worker = new Worker("executions", handleJob, {
-  connection: redis,
-  concurrency: config.workerConcurrency,
-});
-worker.on("failed", async (job, err) => {
-  // Infra-level failure after all BullMQ attempts (e.g. worker crash, DB down) -> DLQ.
-  if (job && job.attemptsMade >= (job.opts.attempts || 1)) {
-    const exec = await Execution.findById(job.data.executionId);
-    if (exec) {
-      exec.status = "FAILED";
-      exec.error = err.message;
-      await exec.save();
+    exec.status = result.status;
+    exec.error = result.error;
+    exec.finishedAt = new Date();
+    await exec.save();
+    if (result.status === "ROLLED_BACK")
       await DeadLetter.create({
         tenantId: exec.tenantId,
         executionId: exec._id,
-        reason: err.message,
+        reason: result.error || "Workflow rolled back",
       });
-    }
-    await dlq.add("infra-failure", {
-      executionId: job.data.executionId,
-      reason: err.message,
+    emitTenant(exec.tenantId, {
+      executionId: String(exec._id),
+      type: "execution",
+      state: exec.status,
+      error: exec.error,
     });
+    claimed = null; // terminal state was persisted successfully
+  } catch (e) {
+    console.error("Local worker error:", e);
+    if (claimed) {
+      try {
+        claimed.status = "FAILED";
+        claimed.error = e.message;
+        claimed.finishedAt = new Date();
+        await claimed.save();
+        await DeadLetter.create({
+          tenantId: claimed.tenantId,
+          executionId: claimed._id,
+          reason: e.message,
+        });
+        emitTenant(claimed.tenantId, {
+          executionId: String(claimed._id),
+          type: "execution",
+          state: "FAILED",
+          error: e.message,
+        });
+      } catch (saveError) {
+        console.error("Could not persist worker failure:", saveError.message);
+      }
+    }
+  } finally {
+    busy = false;
   }
-});
-console.log(`Worker up (concurrency ${config.workerConcurrency})`);
+}
+export function startWorker() {
+  const timer = setInterval(processOne, 500);
+  timer.unref();
+  processOne();
+  console.log("MongoDB local worker started (no Redis required)");
+  return () => clearInterval(timer);
+}

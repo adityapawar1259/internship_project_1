@@ -142,3 +142,20 @@ test("sandbox: runs code, blocks require/process, enforces timeout", async () =>
     /timed out|Script execution/,
   );
 });
+
+import { runners } from "../src/engine/runners.js";
+test("runners: script and condition read workflow input", async () => {
+  const ctx = { input: { n: 7 }, outputs: {} };
+  assert.deepEqual(
+    (await runners.script({ code: "({ doubled: input.n * 2 })" }, ctx)).result,
+    { doubled: 14 },
+  );
+  assert.equal(
+    (await runners.condition({ expression: "input.n > 5" }, ctx)).branch,
+    "true",
+  );
+  assert.equal(
+    (await runners.condition({ expression: "input.n > 50" }, ctx)).branch,
+    "false",
+  );
+});

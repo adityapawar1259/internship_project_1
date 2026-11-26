@@ -40,6 +40,7 @@ export async function runSaga({
   compensate,
   onEvent = () => {},
   sleepFn = sleep,
+  executionId,
 }) {
   const v = validateGraph(graph);
   if (!v.valid) throw new Error("Invalid graph: " + v.errors.join("; "));
@@ -81,7 +82,12 @@ export async function runSaga({
         attempt++;
         try {
           outputs[id] =
-            (await runners[node.type]?.(node.data || {}, { input, outputs })) ??
+            (await runners[node.type]?.(node.data || {}, {
+              input,
+              outputs,
+              executionId,
+              nodeId: id,
+            })) ??
             (() => {
               throw new Error(`No runner for node type "${node.type}"`);
             })();
@@ -131,7 +137,7 @@ export async function runSaga({
     onEvent({ type: "execution", state: status, error: err.message });
     for (const id of [...done].reverse()) {
       try {
-        await compensate(byId.get(id), { input, outputs });
+        await compensate(byId.get(id), { input, outputs, executionId });
         onEvent({ type: "node", nodeId: id, state: "COMPENSATED" });
       } catch (cerr) {
         onEvent({

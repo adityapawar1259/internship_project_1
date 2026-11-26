@@ -2,7 +2,34 @@
 export function validateGraph({ nodes = [], edges = [] } = {}) {
   const errors = [];
   const ids = new Set(nodes.map((n) => n.id));
+  if (nodes.some((n) => !n.id || !n.type))
+    errors.push("Every node needs an id and type");
   if (ids.size !== nodes.length) errors.push("Duplicate node ids");
+  if (!Array.isArray(edges)) errors.push("Edges must be an array");
+  for (const n of nodes) {
+    if (n.type === "http") {
+      try {
+        const u = new URL(n.data?.url);
+        if (!["http:", "https:"].includes(u.protocol)) throw new Error();
+      } catch {
+        errors.push(`HTTP node "${n.id}" needs a valid http/https URL`);
+      }
+      if (n.data?.bodyText) {
+        try {
+          JSON.parse(n.data.bodyText);
+        } catch {
+          errors.push(`HTTP node "${n.id}" has invalid JSON body`);
+        }
+      }
+    }
+    if (
+      n.type === "delay" &&
+      (!Number.isFinite(Number(n.data?.ms)) ||
+        Number(n.data.ms) < 0 ||
+        Number(n.data.ms) > 300000)
+    )
+      errors.push(`Delay node "${n.id}" must be between 0 and 300000 ms`);
+  }
   const starts = nodes.filter((n) => n.type === "start");
   if (starts.length !== 1)
     errors.push(`Exactly one start node required (found ${starts.length})`);

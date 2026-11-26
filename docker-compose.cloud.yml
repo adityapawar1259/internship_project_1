@@ -1,0 +1,32 @@
+# OPTION B - API/workers/UI run in Docker, but use YOUR MongoDB Atlas + Redis links from the root .env
+#   1) uncomment and fill MONGO_URI and REDIS_URL in .env
+#   2) docker compose -f docker-compose.cloud.yml up --build
+services:
+  api:
+    build: ./server
+    environment: &env
+      MONGO_URI: ${MONGO_URI:?Set MONGO_URI in .env}
+      REDIS_URL: ${REDIS_URL:?Set REDIS_URL in .env}
+      MONGO_DB: ${MONGO_DB:-aditydb}
+      ADMIN_SECRET: ${ADMIN_SECRET:-change-me}
+      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-change-me-please}
+      JWT_TTL_HOURS: ${JWT_TTL_HOURS:-24}
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-true}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-600}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-50}
+      ENABLE_DEBUG_ROUTES: ${ENABLE_DEBUG_ROUTES:-true}
+    ports: ["4000:4000"]
+    restart: on-failure
+  worker:
+    build: ./server
+    command: ["node", "src/worker.js"]
+    environment: *env
+    deploy: { replicas: 2 }
+    restart: on-failure
+  client:
+    build:
+      context: ./client
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:4000}
+    ports: ["8080:80"]

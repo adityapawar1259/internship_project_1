@@ -6,6 +6,7 @@ import {
   Execution,
   Event,
   DeadLetter,
+  User,
 } from "./models.js";
 import {
   tenantContext,
@@ -16,15 +17,19 @@ import {
 } from "./middleware.js";
 import { validateGraph } from "./engine/dag.js";
 import { enqueueExecution } from "./queue.js";
+import { consumeQuota } from "./quota.js";
+import { dbName, dbState } from "./db.js";
 
 export const router = Router();
 const wrap = (fn) => (req, res, next) => fn(req, res).catch(next);
 
-// --- Admin bootstrap: create tenant + one-time API key
+// ---------- Admin bootstrap: create tenant + one-time API key
 router.post(
   "/tenants",
   adminOnly,
   wrap(async (req, res) => {
+    if (!req.body.name)
+      return res.status(400).json({ error: "name is required" });
     const tenant = await Tenant.create({
       name: req.body.name,
       monthlyQuota: req.body.monthlyQuota,
@@ -43,12 +48,59 @@ router.post(
   }),
 );
 
-// Everything below is tenant-scoped.
+// ---------- Everything below is tenant-scoped (Bearer token or x-api-key)
 router.use(tenantContext, rateLimiter);
+
+router.get("/me", (req, res) => {
+  const t = req.tenant;
+  const u = req.user;
+  res.json({
+    id: t._id,
+    name: t.name,
+    monthlyQuota: t.monthlyQuota,
+    usedThisMonth: t.usedThisMonth,
+    user: u ? { id: u._id, name: u.name, email: u.email, role: u.role } : null,
+  });
+});
+
+// What is stored in the database for this workspace (shown on the Dashboard).
+router.get(
+  "/db/overview",
+  wrap(async (req, res) => {
+    const q = { tenantId: req.tenantId };
+    const [workflows, executions, events, deadletters, users] =
+      await Promise.all(
+        [Workflow, Execution, Event, DeadLetter, User].map((m) =>
+          m.countDocuments(q),
+        ),
+      );
+    res.json({
+      database: dbName(),
+      state: dbState(),
+      collections: [
+        { name: "workflows", documents: workflows },
+        { name: "executions", documents: executions },
+        { name: "events", documents: events },
+        { name: "deadletters", documents: deadletters },
+        { name: "users", documents: users },
+      ],
+    });
+  }),
+);
 
 router.post("/workflows/validate", (req, res) =>
   res.json(validateGraph(req.body.graph)),
 );
+
+const cleanName = (n) =>
+  String(n || "")
+    .trim()
+    .slice(0, 100) || "Untitled";
+const cleanTrigger = (t) => ({
+  event: String(t?.event || "")
+    .trim()
+    .slice(0, 100),
+}); // '' = manual only
 
 router.post(
   "/workflows",
@@ -57,9 +109,9 @@ router.post(
     if (!v.valid) return res.status(400).json(v);
     const wf = await Workflow.create({
       tenantId: req.tenantId,
-      name: req.body.name,
+      name: cleanName(req.body.name),
       graph: req.body.graph,
-      trigger: req.body.trigger,
+      trigger: cleanTrigger(req.body.trigger),
     });
     res.status(201).json(wf);
   }),
@@ -72,15 +124,44 @@ router.get(
     ),
   ),
 );
+router.get(
+  "/workflows/:id",
+  wrap(async (req, res) => {
+    const wf = await Workflow.findOne({
+      _id: req.params.id,
+      tenantId: req.tenantId,
+    });
+    wf ? res.json(wf) : res.status(404).json({ error: "Workflow not found" });
+  }),
+);
+router.put(
+  "/workflows/:id",
+  wrap(async (req, res) => {
+    const v = validateGraph(req.body.graph);
+    if (!v.valid) return res.status(400).json(v);
+    const wf = await Workflow.findOneAndUpdate(
+      { _id: req.params.id, tenantId: req.tenantId },
+      {
+        name: cleanName(req.body.name),
+        graph: req.body.graph,
+        trigger: cleanTrigger(req.body.trigger),
+      },
+      { new: true },
+    );
+    wf ? res.json(wf) : res.status(404).json({ error: "Workflow not found" });
+  }),
+);
+router.delete(
+  "/workflows/:id",
+  wrap(async (req, res) => {
+    await Workflow.deleteOne({ _id: req.params.id, tenantId: req.tenantId });
+    res.json({ ok: true });
+  }),
+);
 
-async function startRun(tenant, workflowId, input) {
-  if (tenant.usedThisMonth >= tenant.monthlyQuota) return null;
-  const exec = await Execution.create({
-    tenantId: tenant._id,
-    workflowId,
-    input,
-  });
-  await Tenant.updateOne({ _id: tenant._id }, { $inc: { usedThisMonth: 1 } });
+async function startRun(tenantId, workflowId, input) {
+  if (!(await consumeQuota(tenantId))) return null;
+  const exec = await Execution.create({ tenantId, workflowId, input });
   await enqueueExecution(exec._id);
   return exec;
 }
@@ -92,7 +173,7 @@ router.post(
       tenantId: req.tenantId,
     });
     if (!wf) return res.status(404).json({ error: "Workflow not found" });
-    const exec = await startRun(req.tenant, wf._id, req.body.input);
+    const exec = await startRun(req.tenantId, wf._id, req.body.input);
     if (!exec) return res.status(402).json({ error: "Monthly quota exceeded" });
     res.status(202).json(exec);
   }),
@@ -110,27 +191,31 @@ router.get(
 );
 router.get(
   "/executions/:id",
-  wrap(async (req, res) =>
-    res.json(
-      await Execution.findOne({ _id: req.params.id, tenantId: req.tenantId }),
-    ),
-  ),
+  wrap(async (req, res) => {
+    const ex = await Execution.findOne({
+      _id: req.params.id,
+      tenantId: req.tenantId,
+    });
+    ex ? res.json(ex) : res.status(404).json({ error: "Not found" });
+  }),
 );
 
-// Event ingestion: the Change Stream picks this insert up and triggers matching workflows.
+// Event ingestion: the API local poller triggers matching workflows.
 router.post(
   "/events",
   wrap(async (req, res) => {
+    if (typeof req.body.type !== "string" || !req.body.type.trim())
+      return res.status(400).json({ error: "type is required" });
     const ev = await Event.create({
       tenantId: req.tenantId,
-      type: req.body.type,
+      type: req.body.type.trim(),
       payload: req.body.payload,
     });
     res.status(202).json({ id: ev._id });
   }),
 );
 
-// Dead-letter queue
+// ---------- Dead-letter queue
 router.get(
   "/dlq",
   wrap(async (req, res) =>
@@ -149,14 +234,24 @@ router.post(
       tenantId: req.tenantId,
     });
     if (!dl) return res.status(404).json({ error: "Not found" });
-    const old = await Execution.findById(dl.executionId);
-    const exec = await startRun(req.tenant, old.workflowId, old.input);
+    const old = await Execution.findOne({
+      _id: dl.executionId,
+      tenantId: req.tenantId,
+    });
+    if (!old) {
+      await dl.deleteOne();
+      return res
+        .status(404)
+        .json({ error: "The original execution no longer exists" });
+    }
+    const exec = await startRun(req.tenantId, old.workflowId, old.input);
+    if (!exec) return res.status(402).json({ error: "Monthly quota exceeded" });
     await dl.deleteOne();
     res.status(202).json(exec);
   }),
 );
 
-// Dashboard metrics: quota, latency percentiles per hour, failure heatmap (workflow x hour)
+// ---------- Dashboard metrics (last 24h)
 router.get(
   "/metrics",
   wrap(async (req, res) => {
@@ -178,7 +273,6 @@ router.get(
         $group: {
           _id: "$hour",
           avg: { $avg: "$ms" },
-          max: { $max: "$ms" },
           count: { $sum: 1 },
           all: { $push: "$ms" },
         },
@@ -203,11 +297,16 @@ router.get(
         },
       },
     ]);
+    const counts = await Execution.aggregate([
+      { $match: { tenantId: req.tenantId, createdAt: { $gte: since } } },
+      { $group: { _id: "$status", n: { $sum: 1 } } },
+    ]);
     const t = req.tenant;
     res.json({
       quota: { used: t.usedThisMonth, limit: t.monthlyQuota },
       latency,
       heatmap,
+      statusCounts: Object.fromEntries(counts.map((c) => [c._id, c.n])),
     });
   }),
 );

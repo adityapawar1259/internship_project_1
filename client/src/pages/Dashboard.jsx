@@ -16,10 +16,15 @@ export default function Dashboard() {
   const { toast } = useApp();
   const [m, setM] = useState(null);
   const [names, setNames] = useState({});
-  const load = () =>
+  const [dbo, setDbo] = useState(null);
+  const load = () => {
     api("/api/metrics")
       .then(setM)
       .catch((e) => toast(e.message, "error"));
+    api("/api/db/overview")
+      .then(setDbo)
+      .catch(() => {});
+  };
   useEffect(() => {
     api("/api/workflows")
       .then((w) => setNames(Object.fromEntries(w.map((x) => [x._id, x.name]))))
@@ -116,6 +121,30 @@ export default function Dashboard() {
           </div>
         )}
       </div>
+      {dbo && (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <h3>
+            Database <span className="badge">{dbo.database}</span>{" "}
+            <span
+              className={`badge ${dbo.state === "connected" ? "COMPLETED" : "FAILED"}`}
+            >
+              {dbo.state}
+            </span>
+          </h3>
+          <div className="dbgrid">
+            {dbo.collections.map((c) => (
+              <div key={c.name} className="dbcell">
+                <div className="mono muted">{c.name}</div>
+                <b>{c.documents}</b>
+              </div>
+            ))}
+          </div>
+          <p className="muted small" style={{ marginBottom: 0 }}>
+            Documents stored for your workspace. To browse the whole database
+            run <code>npm run db:show</code> in the server folder.
+          </p>
+        </div>
+      )}
       <div className="card">
         <h3>Failure heatmap (workflow × hour, last 24h)</h3>
         {wfs.length === 0 ? (
